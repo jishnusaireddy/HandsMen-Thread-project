@@ -1,0 +1,140 @@
+InventoryBatchJob.apxc
+global class InventoryBatchJob implements Database.Batchable<SObject>, Schedulable {
+
+global Database.QueryLocator start(Database.BatchableContext BC) {
+
+return Database.getQueryLocator(
+
+'SELECT Id, Stock_Quantity__c FROM Product__c WHERE Stock_Quantity__c < 10'
+
+);
+
+}
+
+global void execute(Database.BatchableContext BC, List<SObject> records) {
+
+List<HandsMen_Product__c> productsToUpdate = new List<HandsMen_Product__c>();
+
+// Cast SObject list to Product__c list
+
+for (SObject record : records) {
+
+HandsMen_Product__c product = (HandsMen_Product__c) record;
+
+product.Stock_Quantity__c += 50; // Restock logic
+
+productsToUpdate.add(product);
+
+}
+
+if (!productsToUpdate.isEmpty()) {
+
+try {
+
+update productsToUpdate;
+
+} catch (DmlException e) {
+
+System.debug('Error updating inventory: ' + e.getMessage());
+
+}
+
+}
+
+}
+
+global void finish(Database.BatchableContext BC) {
+
+System.debug('Inventory Sync Completed');
+
+}
+
+// Scheduler Method
+
+global void execute(SchedulableContext SC) {
+
+InventoryBatchJob batchJob = new InventoryBatchJob();
+
+Database.executeBatch(batchJob, 200);
+
+}
+
+}
+
+
+OrderTotalTrigger.apxt
+trigger OrderTotalTrigger on HandsMen_Order__c (before insert, before update) {
+    Set<Id> productIds = new Set<Id>();
+    for (HandsMen_Order__c order : Trigger.new) {
+        if (order.HandsMen_Product__c != null) {
+            productIds.add(order.HandsMen_Product__c);
+        }
+    }
+
+    Map<Id, HandsMen_Product__c> productMap = new Map<Id, HandsMen_Product__c>(
+        [SELECT Id, Price__c FROM HandsMen_Product__c WHERE Id IN :productIds]
+    );
+
+    for (HandsMen_Order__c order : Trigger.new) {
+        if (order.HandsMen_Product__c != null && productMap.containsKey(order.HandsMen_Product__c)) {
+            HandsMen_Product__c product = productMap.get(order.HandsMen_Product__c);
+            if (order.Quantity__c != null && product.Price__c != null) {
+                order.Total_Amount__c = order.Quantity__c * product.Price__c;
+            } else {
+                order.Total_Amount__c = 0; // or leave it null if preferred
+            }
+        }
+    }
+}
+
+StockDeductionTrigger.apxt
+trigger StockDeductionTrigger on HandsMen_Order__c (after insert, after update) {
+    
+    Set<Id> productIds = new Set<Id>();
+
+    // Step 1: Collect product IDs for NEWLY confirmed orders only
+    for (HandsMen_Order__c order : Trigger.new) {
+        HandsMen_Order__c oldOrder = Trigger.isUpdate ? Trigger.oldMap.get(order.Id) : null;
+        
+        Boolean isNewlyConfirmed = order.Status__c == 'Confirmed' && 
+                                   (Trigger.isInsert || oldOrder.Status__c != 'Confirmed');
+        
+        if (isNewlyConfirmed && order.HandsMen_Product__c != null) {
+            productIds.add(order.HandsMen_Product__c);
+        }
+    }
+
+    if (productIds.isEmpty()) {
+        return; // Nothing to process
+    }
+
+    // Step 2: Query Inventory records for those products
+    Map<Id, Inventory__c> inventoryMap = new Map<Id, Inventory__c>(
+        [SELECT Id, Stock_Quantity__c, HandsMen_Product__c 
+         FROM Inventory__c 
+         WHERE HandsMen_Product__c IN :productIds]
+    );
+
+    List<Inventory__c> inventoriesToUpdate = new List<Inventory__c>();
+
+    // Step 3: Deduct stock based on matching product
+    for (HandsMen_Order__c order : Trigger.new) {
+        HandsMen_Order__c oldOrder = Trigger.isUpdate ? Trigger.oldMap.get(order.Id) : null;
+        
+        Boolean isNewlyConfirmed = order.Status__c == 'Confirmed' && 
+                                   (Trigger.isInsert || oldOrder.Status__c != 'Confirmed');
+        
+        if (isNewlyConfirmed && order.HandsMen_Product__c != null && order.Quantity__c != null) {
+            Inventory__c inv = inventoryMap.get(order.HandsMen_Product__c);
+            if (inv != null) {
+                inv.Stock_Quantity__c = (inv.Stock_Quantity__c != null ? inv.Stock_Quantity__c : 0) - order.Quantity__c;
+                inventoriesToUpdate.add(inv);
+            }
+        }
+    }
+
+    // Step 4: Update Inventories in bulk
+    if (!inventoriesToUpdate.isEmpty()) {
+        update inventoriesToUpdate;
+    }
+}
